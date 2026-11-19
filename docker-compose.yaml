@@ -1,0 +1,74 @@
+﻿services:
+  fastapi:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: nlp_sql_fastapi
+    ports:
+      - "${FASTAPI_PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - .:/app
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: nlp_sql_qdrant
+    ports:
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+
+  redis:
+    image: redis:7-alpine
+    container_name: nlp_sql_redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+
+  # worker:
+  #   build:
+  #     context: .
+  #     dockerfile: dockerfile
+  #   container_name: nlp_sql_worker
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     QDRANT_URL: http://qdrant:6333
+  #     REDIS_URL: redis://redis:6379/0
+  #   volumes:
+  #     - .:/app
+  #   depends_on:
+  #     qdrant:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  
+
+volumes:
+  qdrant_data:
+  redis_data:
