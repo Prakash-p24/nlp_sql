@@ -1,4 +1,153 @@
-# Multi-Tenant RAG POC – Seed Data Summary
+# Scripts Guide and Multi-Tenant RAG Seed Data
+
+This folder contains the schema indexing command, a local user seeder, and
+the sample multi-tenant metadata SQL seed. The indexer reads schema metadata
+from the application's PostgreSQL database and writes embedded table
+documents to Qdrant.
+
+## Index stored schema metadata into Qdrant
+
+`index_schema.py` is the command-line entry point for the current
+PostgreSQL-to-Qdrant indexing flow. It authenticates a tenant admin and
+verifies the account's active membership and `admin` role in the selected
+tenant. It then calls the dynamic document builder, embeds documents with
+`BAAI/bge-small-en-v1.5`, and upserts vectors and payloads to Qdrant in
+batches.
+
+This is an admin-only operation: regular tenant users are rejected before
+the document builder or embedding model is called.
+
+### Prerequisites
+
+- `DATABASE_URL` in `.env` connects to the PostgreSQL application database.
+- That database has been migrated and already contains schema metadata
+  rows for the tenant and database you want to index. The sample rows are
+  defined in `seed_multi_tenant.sql`.
+- Qdrant is running and reachable using `QDRANT_URL`. When running the
+  indexer in Docker Compose, its Qdrant URL is set to `http://qdrant:6333`.
+- The Python dependencies in `pyproject.toml` and `poetry.lock` are
+  installed. The model is downloaded from Hugging Face on first use.
+
+This repository's Compose file does not start PostgreSQL. PostgreSQL must
+already be running separately. The sample SQL file seeds metadata in the
+application database; it does not create the registered customer databases.
+
+#### Connection addresses by run location
+
+Set `DATABASE_URL` in `.env` to an address reachable from the process that
+runs the indexer:
+
+- **Docker Compose:** if PostgreSQL runs on the Windows host, use
+  `host.docker.internal` as the host in `DATABASE_URL`. `localhost` inside
+  the container refers to that container itself.
+- **Windows / Poetry:** use `localhost` (or the PostgreSQL server's host/IP)
+  when PostgreSQL is running on the same machine. PostgreSQL must allow the
+  connection in `pg_hba.conf` and listen on the requested interface.
+
+Likewise, use `QDRANT_URL=http://qdrant:6333` from a Compose container and
+`QDRANT_URL=http://localhost:6333` from a process running directly on
+Windows when Qdrant is published on the default port. Compose overrides the
+Qdrant URL for its containers. Keep credentials in `.env`; do not put them
+in command-line arguments or commit `.env`.
+
+### Run with Docker Compose
+
+Build or rebuild the FastAPI image when dependencies change, start
+Qdrant, and run the index command from the repository root:
+
+```powershell
+docker compose build fastapi
+docker compose up -d qdrant
+docker compose run --rm --no-deps --entrypoint python fastapi -m scripts.index_schema --tenant-slug tenant-a --admin-email tenant-a@example.test --database-name "Retail Source DB"
+```
+
+The command prompts for the admin password. It does not accept a password
+argument or save it in shell history. Do not run it with a restricted user:
+the caller must be an active member with the tenant's `admin` role.
+
+Sample database names:
+
+| Tenant slug | Tenant admin email | Registered database |
+|---|---|---|
+| `tenant-a` | `tenant-a@example.test` | `Retail Source DB` |
+| `tenant-b` | `tenant-b@example.test` | `Healthcare Source DB` |
+| `tenant-c` | `tenant-c@example.test` | `Finance Source DB` |
+
+If a tenant has only one registered database, `--database-name` can be
+omitted. If it has multiple databases, specify the name to avoid
+ambiguity.
+
+For an installed local Poetry environment, run this from the repository
+root. Make sure `.env` uses host-reachable PostgreSQL and Qdrant addresses
+as described above:
+
+```powershell
+poetry run python -m scripts.index_schema --tenant-slug tenant-a --admin-email tenant-a@example.test --database-name "Retail Source DB"
+```
+
+The first run downloads the embedding model and can take longer while the
+model is cached. Keep the process connected to the network for that initial
+download. In Docker Compose, the cache is persisted in the
+`huggingface_cache` volume.
+
+### What the indexer writes
+
+The indexer builds one document per selected, active table. Each document
+can include schema and table names, column definitions, relationships,
+business descriptions and synonyms. Columns marked sensitive in
+`business_column_metadata` are excluded. The builder does not connect to
+the customer database listed in `tenant_databases`; it uses metadata
+already stored in the application database.
+
+For each batch, the indexer:
+
+1. Reads metadata for the selected tenant and database.
+2. Builds LangChain documents dynamically from those records.
+3. Embeds the document text with the configured embedding model.
+4. Creates the Qdrant collection and payload indexes if needed.
+5. Upserts each dense vector with its searchable text and metadata
+   payload.
+
+Point IDs are stable across runs, so re-indexing updates the matching
+table points. The command reports the tenant, database, model,
+collection, document count and batch count. `SCHEMA_INDEX_BATCH_SIZE`
+sets the default batch size; override it for a run with `--batch-size`.
+Docker Compose stores the Hugging Face model cache in a named volume.
+
+The script does not remove Qdrant points for tables deleted from the
+metadata database, persist job progress in `vector_index_jobs`, or expose
+a retrieval API. Qdrant has payload indexes for tenant/database filters
+and full-text matching, but keyword/hybrid retrieval is not implemented
+yet.
+
+## Other script notes
+
+### `insert_user.py`
+
+Seeds a default tenant, sample admin and user accounts, and their basic role
+and permission assignments in the application database. It uses
+`DATABASE_URL` from `.env`. Run it from the repository root with:
+
+```powershell
+poetry run python -m scripts.insert_user
+```
+
+The sample credentials are defined in the script and are intended only for
+local development. Change or remove them before using this seeder in any
+shared or production environment.
+
+### `seed_multi_tenant.sql`
+
+Seeds the three sample tenant metadata sets described below. Apply it to the
+migrated application database using your PostgreSQL SQL client. It is safe
+to re-run for the supplied IDs because inserts use `ON CONFLICT (id) DO
+NOTHING`; that does not update existing rows.
+
+`seed_multi_tenant.sql` seeds application-side metadata. It does not
+create the sample customer databases themselves, create Qdrant vectors,
+or populate customer, patient, sales, or invoice records. The remainder
+of this README summarizes those seed rows and gives SQL verification
+queries.
 
 ## 1. Overview
 
@@ -9,7 +158,7 @@ This document summarizes the sample data defined in the supplied multi-tenant RA
 | Tenant records defined | **3** |
 | Application tables populated | **24** |
 | Total seed rows defined across those tables | **103** |
-| User accounts defined | **3** |
+| User accounts defined | **4** |
 | Tenant database registry records defined | **3** |
 | Metadata tables represented across the tenants | **6** |
 

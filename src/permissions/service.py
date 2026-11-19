@@ -7,7 +7,7 @@ from typing import Mapping
 from sqlalchemy.orm import Session
 
 from src.databases.models import TenantDatabase
-from src.metadata.models import DatabaseColumn, DatabaseTable
+from src.metadata.models import DatabaseColumn, DatabaseSchema, DatabaseTable
 from src.permissions.models import (
     DataScopePolicy,
     Permission,
@@ -88,6 +88,8 @@ def assign_scope_policy_to_role(
     ).one_or_none()
     if role is None or policy is None:
         raise PermissionDenied("Role and policy must belong to the requested tenant")
+    if role.role_name == "admin":
+        raise PermissionDenied("Tenant administrator roles are unrestricted and cannot receive data-scope policies")
     assignment = RoleDataScopeAssignment(role_id=role_uuid, policy_id=policy_uuid)
     db.add(assignment)
     db.flush()
@@ -110,6 +112,16 @@ def assign_scope_policy_to_user(
     ).one_or_none()
     if membership is None or policy is None:
         raise PermissionDenied("Membership and policy must belong to the requested tenant")
+
+    is_admin = db.query(UserRole.id).join(
+        Role, Role.id == UserRole.role_id
+    ).filter(
+        UserRole.tenant_user_id == membership.id,
+        Role.tenant_id == tenant_uuid,
+        Role.role_name == "admin",
+    ).first()
+    if is_admin is not None:
+        raise PermissionDenied("Tenant administrators are unrestricted and cannot receive user data-scope policies")
 
     if scope_values and "tables" in scope_values:
         policy_scope = _parse_tables((policy.policy_definition or {}).get("tables"))
@@ -320,6 +332,36 @@ def _validate_scope(
         raise PermissionDenied("A scope references a column outside its table/tenant/database")
 
 
+def _full_database_scope(
+    db: Session,
+    tenant_id: uuid.UUID,
+    database_id: uuid.UUID,
+) -> AccessScope:
+    """Return all selected active tables and columns inside one tenant database."""
+    table_ids = db.query(DatabaseTable.id).join(
+        DatabaseSchema, DatabaseSchema.id == DatabaseTable.schema_id
+    ).filter(
+        DatabaseTable.tenant_id == tenant_id,
+        DatabaseTable.database_id == database_id,
+        DatabaseTable.is_active.is_(True),
+        DatabaseTable.is_selected.is_(True),
+        DatabaseSchema.is_selected.is_(True),
+    ).all()
+    scope: dict[uuid.UUID, set[uuid.UUID]] = {
+        table_id: set() for (table_id,) in table_ids
+    }
+    if scope:
+        column_rows = db.query(DatabaseColumn.table_id, DatabaseColumn.id).filter(
+            DatabaseColumn.table_id.in_(scope),
+            DatabaseColumn.tenant_id == tenant_id,
+        ).all()
+        for table_id, column_id in column_rows:
+            scope[table_id].add(column_id)
+    return AccessScope(
+        table_columns={table_id: frozenset(column_ids) for table_id, column_ids in scope.items()}
+    )
+
+
 def get_effective_scope(
     db: Session,
     *,
@@ -330,9 +372,9 @@ def get_effective_scope(
 ) -> AccessScope:
     """Return effective table/column access for one active tenant membership.
 
-    Role scope policies form the baseline. User allow policies intersect that
-    baseline; role and user deny policies subtract from it. Missing action or
-    role allow policies fail closed.
+    Tenant administrators receive all selected active tables and columns in
+    the requested tenant database for any registered permission code. Regular
+    users are governed by role policies, then narrowed by their user policies.
     """
     tenant_uuid, user_uuid, database_uuid = map(_as_uuid, (tenant_id, user_id, database_id))
     database = db.query(TenantDatabase).filter(
@@ -358,6 +400,20 @@ def get_effective_scope(
     ).all()]
     if not role_ids:
         raise PermissionDenied("User has no role in this tenant")
+
+    action_exists = db.query(Permission.id).filter(
+        Permission.permission_code == permission_code
+    ).first()
+    if action_exists is None:
+        raise PermissionDenied(f"Unknown permission action: {permission_code}")
+
+    is_tenant_admin = db.query(Role.id).filter(
+        Role.id.in_(role_ids),
+        Role.tenant_id == tenant_uuid,
+        Role.role_name == "admin",
+    ).first()
+    if is_tenant_admin is not None:
+        return _full_database_scope(db, tenant_uuid, database_uuid)
 
     action_effects = [effect.lower() for (effect,) in db.query(RolePermission.effect)
         .join(Permission, Permission.id == RolePermission.permission_id)

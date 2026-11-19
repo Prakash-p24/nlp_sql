@@ -11,8 +11,10 @@
     environment:
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379/0
+      HF_HOME: /root/.cache/huggingface
     volumes:
       - .:/app
+      - huggingface_cache:/root/.cache/huggingface
     depends_on:
       qdrant:
         condition: service_healthy
@@ -72,3 +74,4 @@
 volumes:
   qdrant_data:
   redis_data:
+  huggingface_cache:

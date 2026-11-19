@@ -27,6 +27,7 @@ htmlcov/
 
 # Local application data
 instance/
+schema_doc_previews/
 *.db
 *.sqlite
 *.sqlite3

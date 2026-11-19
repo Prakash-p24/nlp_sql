@@ -91,8 +91,9 @@ of metadata documents and their vectors.
     fields.
 6.  The backend derives tenant identity from the authenticated user. It
     never trusts a tenant ID supplied in the question.
-7.  Table-level access is included. **Data-scope policies and user
-    data-scope assignments are intentionally excluded** from this POC.
+7.  Table and column data scopes are implemented for regular users.
+    Tenant administrators have unrestricted access within their tenant and
+    selected database; user-level policies narrow regular users only.
 8.  Column-level permissions can be added later if required. For this
     POC, the table permission is the primary resource-level permission.
 9.  Actual customer database records are not copied into Qdrant. Only
@@ -574,6 +575,55 @@ Example tenant mapping:
 The test users should only have the permissions required for their
 tenant's sample tables.
 
+### 5.1 Load sample metadata, preview documents, and index to Qdrant
+
+The repository includes sample application metadata in
+`scripts/seed_multi_tenant.sql`. It seeds schema registry records for two
+tables per tenant; it does not create the tenant-owned source databases.
+The indexer reads these stored metadata records from the application
+PostgreSQL database.
+
+Set `DATABASE_URL` in `.env` to a running PostgreSQL application
+database, then run these commands from the project root:
+
+``` powershell
+docker compose build fastapi
+docker compose run --rm --no-deps --entrypoint alembic fastapi upgrade head
+docker compose run --rm --no-deps --entrypoint python fastapi -m scripts.load_sample_metadata
+```
+
+Preview the generated documents before indexing. This command prints the
+document text and Qdrant payload metadata; it does not embed or write to
+Qdrant.
+
+``` powershell
+docker compose run --rm --no-deps --entrypoint python fastapi -m scripts.preview_schema_documents --tenant-slug tenant-a
+```
+
+Start Qdrant, then run the indexing script for the selected tenant and
+registered database:
+
+``` powershell
+docker compose up -d qdrant
+docker compose run --rm --no-deps --entrypoint python fastapi -m scripts.index_schema --tenant-slug tenant-a --admin-email tenant-a@example.test --database-name "Retail Source DB"
+```
+
+The command prompts for the administrator's password. It verifies the
+account's active membership and `admin` role in that tenant before
+indexing. Regular tenant users are rejected before document building or
+embedding begins.
+
+Use `tenant-b` with `Healthcare Source DB` or `tenant-c` with
+`Finance Source DB` for the other samples. The indexer reads selected
+table metadata in batches, builds one document per table, embeds with
+`BAAI/bge-small-en-v1.5`, and upserts the dense vector and payload into
+the configured Qdrant collection. The first run downloads the embedding
+model; Compose keeps its Hugging Face cache in a named volume.
+
+`SCHEMA_INDEX_BATCH_SIZE` controls the default number of tables per
+batch. Override it in `.env` or pass `--batch-size` to the script. See
+[`scripts/README.md`](scripts/README.md) for all helper commands.
+
 ------------------------------------------------------------------------
 
 ## 6. Qdrant setup
@@ -613,10 +663,12 @@ client = QdrantClient(url="http://localhost:6333")
 
 client.create_collection(
     collection_name="tenant_schema_metadata",
-    vectors_config=models.VectorParams(
-        size=384,
-        distance=models.Distance.COSINE
-    )
+    vectors_config={
+        "dense": models.VectorParams(
+            size=384,
+            distance=models.Distance.COSINE,
+        )
+    },
 )
 ```
 
@@ -629,15 +681,24 @@ match the selected embedding model's output dimension.
 for field in [
     "tenant_id",
     "database_id",
+    "schema_id",
+    "schema_name",
+    "qualified_table_name",
     "document_type",
     "table_id",
-    "is_active"
+    "table_name",
 ]:
     client.create_payload_index(
         collection_name="tenant_schema_metadata",
         field_name=field,
         field_schema=models.PayloadSchemaType.KEYWORD
     )
+
+client.create_payload_index(
+    collection_name="tenant_schema_metadata",
+    field_name="text",
+    field_schema=models.PayloadSchemaType.TEXT,
+)
 ```
 
 Store UUID values as consistent strings in Qdrant payloads and use the
@@ -653,10 +714,9 @@ same representation in filters.
   "table_id": "table-a-uuid",
   "document_type": "table",
   "schema_name": "public",
+  "qualified_table_name": "public.sales_orders",
   "table_name": "sales_orders",
-  "is_active": true,
-  "source_version": 1,
-  "document_content": "Sales orders table contains customer purchase information..."
+  "text": "Schema: public\nTable: sales_orders\nColumns: ..."
 }
 ```
 
@@ -669,115 +729,93 @@ of inserting duplicates.
 
 ### 7.1 Metadata sources
 
-  -----------------------------------------------------------------------
-  Document type                       PostgreSQL source tables
-  ----------------------------------- -----------------------------------
-  Table document                      `database_tables`,
-                                      `business_table_metadata`
-
-  Column document                     `database_columns`,
-                                      `business_column_metadata`
-
-  Relationship document               `database_relationships`,
-                                      `database_constraints`
-
-  Business synonym document           `business_synonyms`
-
-  Procedure document (optional)       `database_procedures`,
-                                      `procedure_parameters`,
-                                      `business_procedure_metadata`
-  -----------------------------------------------------------------------
+The current builder creates **one document per selected active table**
+from `database_schemas`, `database_tables`, `database_columns`,
+`database_relationships`, `business_table_metadata`,
+`business_column_metadata`, and `business_synonyms`. It omits columns
+marked sensitive in `business_column_metadata`.
 
 ### 7.2 Example table document
 
 ``` text
-Tenant: Tenant A
-Database: Retail Database
 Schema: public
-
-Table: sales_orders
-
-Technical description:
-Stores sales order records.
-
-Business description:
-Contains customer purchase information.
-
-Business purpose:
-Used for sales reporting.
-
+Table: customers
+Qualified table: public.customers
+Table type: BASE TABLE
+Technical description: Retail customer master records.
+Business description: Contains retail customer master information.
+Business purpose: Identify customers and support customer-level sales analysis.
+Usage: Join to orders using customer_id.
 Columns:
-- order_id: Unique order identifier.
-- customer_id: Customer identifier.
-- order_amount: Total amount of the order.
-- order_date: Date of the order.
-
+- customer_id (integer, primary key, unique, not nullable)
+- customer_name (varchar(150), not nullable)
+- email (varchar(255), unique, nullable)
 Relationships:
-- sales_orders.customer_id references customers.customer_id.
-
-Business synonyms:
-- Revenue
-- Sales amount
-- Order value
+- public.orders.customer_id foreign_key public.customers.customer_id
 ```
 
 ### 7.3 Indexing flow
 
 ``` text
-PostgreSQL metadata tables
+Application PostgreSQL metadata
           |
           v
-Read metadata for one tenant/database
+Select one tenant and registered database
           |
           v
-Combine technical + business metadata
+Read selected tables in pages
           |
           v
-Build table/column/relationship/synonym documents
+Build one document per table
           |
           v
-Generate embeddings
+Batch embed with BAAI/bge-small-en-v1.5
           |
           v
-Upsert points into Qdrant
-          |
-          v
-Update vector_index_versions and vector_index_jobs
+Upsert dense vectors and searchable payloads in Qdrant
 ```
 
-### 7.4 Python indexing outline
+Each Qdrant point uses a stable ID derived from tenant, database, and
+table IDs. Payload fields include `tenant_id`, `database_id`, `schema_id`,
+`schema_name`, `table_id`, `table_name`, `qualified_table_name`,
+`document_type`, and the generated document text in `text`. Qdrant stores
+the dense vector under the `dense` vector name. The text payload index
+supports lexical queries against document text; semantic nearest-neighbor
+search uses the dense vector. A keyword/hybrid retrieval endpoint is not
+implemented yet.
 
-``` python
-def index_database_metadata(tenant_id, database_id):
+### 7.4 Run the indexing script
 
-    # 1. Validate tenant/database relationship.
-    # 2. Read technical schema metadata from PostgreSQL.
-    # 3. Read business metadata from PostgreSQL.
-    # 4. Build table, column, relationship and synonym documents.
-    # 5. Generate embeddings using the selected embedding model.
-    # 6. Create stable Qdrant point IDs.
-    # 7. Upsert vectors and payloads into Qdrant.
-    # 8. Record indexing version and job status in PostgreSQL.
+After loading the sample SQL data and starting Qdrant, run this command
+from the project root:
 
-    pass
+``` powershell
+docker compose up -d qdrant
+docker compose run --rm --no-deps --entrypoint python fastapi -m scripts.index_schema --tenant-slug tenant-a --admin-email tenant-a@example.test --database-name "Retail Source DB"
 ```
 
-The metadata query layer must always filter by both tenant and database
-IDs. Do not load all tenants' metadata into an unrestricted indexing
-job.
+For a local Poetry environment, use `poetry run python -m scripts.index_schema`
+with the same arguments. The script resolves the tenant slug and database
+name from application PostgreSQL and calls `index_database_schema()`.
+`--batch-size` overrides `SCHEMA_INDEX_BATCH_SIZE` for a run.
+
+The loader reads the application's stored schema metadata; it does not
+connect to the customer database recorded in `tenant_databases` or
+extract a live schema from it.
 
 ### 7.5 Re-indexing strategy
 
 For this POC:
 
--   Initial indexing: index all selected metadata for each tenant.
--   Metadata update: rebuild and upsert the affected document.
--   Metadata deletion: delete or deactivate the corresponding Qdrant
-    point.
--   Embedding model change: create a new collection or a versioned index
-    and re-embed all documents.
--   Index failure: record the error in `vector_index_jobs` and allow a
-    retry.
+-   Initial indexing: run `scripts.index_schema` for each tenant/database.
+-   Re-indexing: stable IDs make Qdrant replace points for tables that
+    still exist in metadata.
+-   Metadata deletion: stale Qdrant points are not deleted automatically
+    yet; add cleanup before relying on re-indexing after table removal.
+-   Embedding model change: create a compatible new collection and
+    re-embed all documents.
+-   Job progress is reported in the CLI; persisting indexing status in
+    `vector_index_jobs` is a future step.
 
 ------------------------------------------------------------------------
 
@@ -849,7 +887,7 @@ results = client.query_points(
 )
 
 for point in results.points:
-    print(point.score, point.payload["document_content"])
+    print(point.score, point.payload["text"])
 ```
 
 Use the authenticated tenant and authorized database values from the
@@ -1067,9 +1105,11 @@ multi_tenant_rag_poc/
 │   └── versions/
 │
 ├── scripts/
-│   ├── seed_tenants.py
-│   ├── seed_users.py
-│   └── index_metadata.py
+│   ├── seed_multi_tenant.sql
+│   ├── load_sample_metadata.py
+│   ├── preview_schema_documents.py
+│   ├── index_schema.py
+│   └── README.md
 │
 ├── tests/
 │   ├── conftest.py
@@ -1090,8 +1130,8 @@ multi_tenant_rag_poc/
 │       ├── test_tenant_isolation.py
 │       └── test_table_permissions.py
 │
-├── docker-compose.yml
-├── Dockerfile
+├── docker-compose.yaml
+├── dockerfile
 ├── docker-entrypoint.sh
 ├── alembic.ini
 ├── pyproject.toml
@@ -1156,8 +1196,8 @@ multi_tenant_rag_poc/
   `alembic/`                          PostgreSQL application database
                                       migrations
 
-  `scripts/`                          Tenant/user seed scripts and
-                                      metadata indexing utilities
+  `scripts/`                          Sample metadata loader, document
+                                      preview and Qdrant indexing CLI
 
   `tests/`                            Unit, integration and security
                                       tests
@@ -1337,24 +1377,18 @@ After this milestone, you will have a working multi-tenant RAG POC.
 Example `.env.example`:
 
 ``` env
-APP_NAME=multi-tenant-rag-poc
-APP_ENV=development
-
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DB=rag_application
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=change_me
+DATABASE_URL=postgresql+psycopg://<username>:<password>@<host>:5432/<database>
+JWT_SECRET_KEY=replace-with-a-long-random-secret
+JWT_ALGORITHM=HS256
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=30
+JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
 
 QDRANT_URL=http://localhost:6333
 QDRANT_API_KEY=
-
 QDRANT_COLLECTION=tenant_schema_metadata
-
 EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 EMBEDDING_DIMENSION=384
-
-DEFAULT_TOP_K=5
+SCHEMA_INDEX_BATCH_SIZE=64
 ```
 
 Do not commit the real `.env` file or credentials to Git.
@@ -1369,11 +1403,11 @@ uvicorn[standard]
 sqlalchemy
 psycopg[binary]
 alembic
-qdrant-client
+langchain-core
+langchain-huggingface
+langchain-qdrant
 sentence-transformers
-pydantic-settings
-python-jose[cryptography]
-passlib[bcrypt]
+qdrant-client
 pytest
 httpx
 ```
@@ -1394,15 +1428,18 @@ security requirements of your application.
 5.  Resolve tenant identity from authenticated server-side context.
 6.  Validate user table permissions before returning retrieved
     documents.
-7.  Do not put database passwords, personal records or sensitive
+7.  Tenant administrators receive all registered actions and all selected
+    active schema objects within their tenant/database. Role and user data
+    scopes restrict regular members only.
+8.  Do not put database passwords, personal records or sensitive
     credentials in Qdrant payloads.
-8.  Keep metadata document IDs stable so indexing can be repeated
+9.  Keep metadata document IDs stable so indexing can be repeated
     safely.
-9.  Use the same embedding model for indexing and query embedding.
-10. Measure retrieval accuracy before adding an LLM.
-11. Keep data-scope policies and user data-scope assignments out of this
-    POC as requested.
-12. Do not execute LLM-generated SQL without parsing, authorization
+10.  Use the same embedding model for indexing and query embedding.
+11. Measure retrieval accuracy before adding an LLM.
+12. Apply user data scopes to regular members and keep administrator access
+    unrestricted within the tenant/database boundary.
+13. Do not execute LLM-generated SQL without parsing, authorization
     checks, read-only restrictions where applicable, and query limits.
 
 ------------------------------------------------------------------------

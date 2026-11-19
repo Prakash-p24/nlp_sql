@@ -23,15 +23,23 @@ table metadata but no columns. `scope_type` is `allowlist` or `denylist`.
 ## How effective access is calculated
 
 1. The user must have an active membership in the requested tenant.
-2. A role assigned to that membership must have an `allow` action permission.
+2. If the membership has that tenant's `admin` role, the administrator is
+   granted every registered permission code and all selected active tables
+   and columns in the requested database. This remains scoped to that tenant
+   and database. Role and user data-scope policies do not narrow admin access.
+3. For regular users, a role assigned to the membership must have an `allow` action permission.
    Any matching `deny` action permission wins.
-3. At least one role-level allow data-scope policy must match the action. The
+4. At least one role-level allow data-scope policy must match the action. The
    union of matching role allows is the role baseline; role denies are removed.
-4. Matching user-level allow scopes intersect (narrow) the role baseline.
+5. Matching user-level allow scopes intersect (narrow) the role baseline.
    User-level denies are then removed. A user grant cannot add access outside
    the role baseline.
-5. Missing action grants, missing role scope grants, or invalid tenant/resource
+6. Missing action grants, missing role scope grants, or invalid tenant/resource
    IDs fail closed with `PermissionDenied`.
+
+User-level data-scope policies cannot be assigned to a tenant administrator,
+and role-level data-scope policies cannot be assigned to the tenant's `admin`
+role. Use regular tenant roles and user assignments to apply restrictions.
 
 ## Enforce it in a FastAPI endpoint
 
@@ -124,10 +132,10 @@ ownership and prevent user assignment values from widening their policy.
 
 Apply the schema migration, then execute `scripts/seed_multi_tenant.sql` after
 the ordinary tenant, role, database, table, and column rows are available. The
-seed includes broad admin role policies for each tenant, plus a Tenant A
-analyst account. That analyst receives a role policy allowing two customer
-columns and a user policy narrowing access to `customer_id` only. Admin users
-have no user-level narrowing, so their role baseline remains broad.
+seed includes admin role policies for each tenant, plus a Tenant A analyst
+account. Admin access is unrestricted within the selected tenant database
+regardless of those policies. The analyst receives a role policy allowing two
+customer columns and a user policy narrowing access to `customer_id` only.
 
 Demo logins (password `Demo@12345`):
 
