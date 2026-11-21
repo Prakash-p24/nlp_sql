@@ -37,6 +37,14 @@ table metadata but no columns. `scope_type` is `allowlist` or `denylist`.
 6. Missing action grants, missing role scope grants, or invalid tenant/resource
    IDs fail closed with `PermissionDenied`.
 
+After successful login, the API checks Redis for the user's permitted table and
+column IDs for each active tenant/database pair and the `METADATA_VIEW` and
+`CHAT_QUERY` actions. It calculates permissions from PostgreSQL only when a
+scope is missing or invalid in the cache. Scope dependencies also read this
+cache first and calculate from PostgreSQL on a miss. Entries expire after
+`ACCESS_SCOPE_CACHE_TTL_SECONDS` (60 seconds by default), so permission changes
+take effect after the cache entry expires.
+
 User-level data-scope policies cannot be assigned to a tenant administrator,
 and role-level data-scope policies cannot be assigned to the tenant's `admin`
 role. Use regular tenant roles and user assignments to apply restrictions.

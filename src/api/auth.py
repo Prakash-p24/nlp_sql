@@ -17,6 +17,7 @@ from src.auth.service import (
     refresh_access_token,
     revoke_refresh_token,
 )
+from src.permissions.scope_cache import warm_user_scopes
 
 logger = get_logger(__name__)
 
@@ -62,6 +63,11 @@ def login(login_data: LoginRequest, db: Session = Depends(get_db)):
             )
 
         access_token, refresh_token = create_tokens(db=db, user=user)
+        try:
+            warm_user_scopes(db, user.user_id)
+        except Exception:
+            # Cache availability must not prevent a valid user from logging in.
+            logger.warning("Could not warm access scope cache for user %s", user.user_id, exc_info=True)
         logger.info("User logged in: %s", login_data.email_address)
 
         return {

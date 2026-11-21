@@ -479,4 +479,7 @@ def get_effective_scope(
         )
 
     _validate_scope(db, effective, tenant_uuid, database_uuid)
-    return AccessScope(table_columns=effective)
+    # Store explicit column IDs in AccessScope so cache and Qdrant filters can
+    # operate on concrete resources rather than wildcard grants.
+    exact_scope = _expand_wildcards(db, effective, tenant_uuid, database_uuid)
+    return AccessScope(table_columns=exact_scope)

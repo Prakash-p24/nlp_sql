@@ -201,30 +201,6 @@ def build_schema_documents(
         if table_synonyms:
             lines.append(f"Also called: {', '.join(sorted(set(table_synonyms)))}")
 
-        table_columns = columns_by_table.get(table.id, [])
-        if table_columns:
-            lines.append("Columns:")
-            for column, business_column in table_columns:
-                properties = [column.data_type]
-                if column.is_primary_key:
-                    properties.append("primary key")
-                if column.is_foreign_key:
-                    properties.append("foreign key")
-                if column.is_unique:
-                    properties.append("unique")
-                properties.append("nullable" if column.is_nullable else "not nullable")
-                line = f"- {column.column_name} ({', '.join(properties)})"
-                if business_column:
-                    description = business_column.business_definition or business_column.business_description
-                    if description:
-                        line += f": {description}"
-                    if business_column.usage_instructions:
-                        line += f" Usage: {business_column.usage_instructions}"
-                column_synonyms = synonyms_by_resource.get(column.id, [])
-                if column_synonyms:
-                    line += f" Also called: {', '.join(sorted(set(column_synonyms)))}"
-                lines.append(line)
-
         table_relationships = sorted(set(relationships_by_table.get(table.id, [])))
         if table_relationships:
             lines.append("Relationships:")
@@ -245,4 +221,57 @@ def build_schema_documents(
                 },
             )
         )
+
+        # Each non-sensitive column gets its own vector so retrieval can rank
+        # individual fields and enforce column-level permissions precisely.
+        for column, business_column in columns_by_table.get(table.id, []):
+            properties = [column.data_type]
+            if column.is_primary_key:
+                properties.append("primary key")
+            if column.is_foreign_key:
+                properties.append("foreign key")
+            if column.is_unique:
+                properties.append("unique")
+            properties.append("nullable" if column.is_nullable else "not nullable")
+            column_lines = [
+                f"Schema: {schema.schema_name}",
+                f"Table: {table.table_name}",
+                f"Qualified table: {qualified_name}",
+                f"Column: {column.column_name}",
+                f"Qualified column: {qualified_name}.{column.column_name}",
+                f"Column type: {', '.join(properties)}",
+            ]
+            if schema.description:
+                column_lines.append(f"Schema description: {schema.description}")
+            if table.technical_description:
+                column_lines.append(f"Table description: {table.technical_description}")
+            if table_meta and table_meta.business_description:
+                column_lines.append(f"Table business description: {table_meta.business_description}")
+            if business_column:
+                description = business_column.business_definition or business_column.business_description
+                if description:
+                    column_lines.append(f"Business description: {description}")
+                if business_column.usage_instructions:
+                    column_lines.append(f"Usage: {business_column.usage_instructions}")
+            column_synonyms = synonyms_by_resource.get(column.id, [])
+            if column_synonyms:
+                column_lines.append(f"Also called: {', '.join(sorted(set(column_synonyms)))}")
+            documents.append(
+                Document(
+                    page_content="\n".join(column_lines),
+                    metadata={
+                        "tenant_id": str(tenant_id),
+                        "database_id": str(database_id),
+                        "schema_id": str(schema.id),
+                        "schema_name": schema.schema_name,
+                        "table_id": str(table.id),
+                        "table_name": table.table_name,
+                        "qualified_table_name": qualified_name,
+                        "column_id": str(column.id),
+                        "column_name": column.column_name,
+                        "qualified_column_name": f"{qualified_name}.{column.column_name}",
+                        "document_type": "column",
+                    },
+                )
+            )
     return documents

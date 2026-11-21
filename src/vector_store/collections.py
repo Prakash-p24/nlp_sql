@@ -10,6 +10,8 @@ PAYLOAD_KEYWORD_FIELDS = (
     "schema_name",
     "table_id",
     "table_name",
+    "column_id",
+    "column_name",
     "qualified_table_name",
     "document_type",
 )

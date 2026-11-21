@@ -9,16 +9,17 @@ from src.vector_store.collections import ensure_schema_collection
 
 
 def stable_document_id(document: Document) -> str:
-    """Make re-indexing upsert the same table document instead of duplicating it."""
+    """Make re-indexing upsert the same table or column document."""
     metadata = document.metadata
-    identity = ":".join(
-        (
-            metadata["tenant_id"],
-            metadata["database_id"],
-            metadata["table_id"],
-            metadata["document_type"],
-        )
-    )
+    identity_parts = [
+        metadata["tenant_id"],
+        metadata["database_id"],
+        metadata["table_id"],
+        metadata["document_type"],
+    ]
+    if metadata.get("column_id"):
+        identity_parts.append(metadata["column_id"])
+    identity = ":".join(identity_parts)
     return str(uuid.uuid5(uuid.NAMESPACE_URL, identity))
 
 

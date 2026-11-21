@@ -15,7 +15,7 @@ def index_database_schema(
     *,
     batch_size: int = SCHEMA_INDEX_BATCH_SIZE,
 ) -> dict[str, int]:
-    """Build, embed, and upsert selected table documents in bounded batches."""
+    """Build, embed, and upsert selected table and column documents in batches."""
     if batch_size < 1:
         raise ValueError("batch_size must be greater than zero")
 
@@ -36,6 +36,8 @@ def index_database_schema(
         vectors = embed_documents([document.page_content for document in documents])
         indexed_documents += upsert_documents(documents, vectors)
         batches += 1
-        offset += len(documents)
+        # The builder paginates over tables, while each page now returns one
+        # table document plus zero or more column documents per table.
+        offset += batch_size
 
     return {"indexed_documents": indexed_documents, "batches": batches}
